@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Comparar revisiones · INFRISA</title>
+<link rel="stylesheet" href="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/style.min.css">
+<style>
+  html, body { margin: 0; height: 100%; font-family: Arial, sans-serif; color: #103a5a; }
+  #barra { background: #103a5a; color: #fff; padding: 8px 16px; display: flex; gap: 18px; align-items: center; height: 40px; box-sizing: border-box; }
+  #barra b { color: #7fbfe0; letter-spacing: 1px; }
+  #barra .a { color: #ff8a8a; } #barra .b { color: #8fd0f5; }
+  #visor { position: absolute; top: 40px; bottom: 0; left: 0; right: 0; }
+  #msg { position: absolute; top: 40px; left: 0; right: 0; padding: 24px; font-size: 15px; z-index: 5; background: #fff; }
+  #msg.err { color: #8a2a00; }
+</style>
+</head>
+<body>
+<div id="barra"><b>INFRISA · COMPARAR</b><span id="titulo">Cargando…</span></div>
+<div id="msg">Conectando con Autodesk…</div>
+<div id="visor"></div>
+
+<script src="config.js"></script>
+<script src="https://developer.api.autodesk.com/modelderivative/v2/viewers/7.*/viewer3D.min.js"></script>
+<script>
+/* Compara dos revisiones de un plano (PDF de Autodesk Docs) con la extensión PixelCompare del visor de APS.
+   Enlace:  comparar.html?p=<b.proyecto>&a=<item revisión vigente>&b=<item revisión anterior>
+   Acceso: inicio de sesión de cada usuario en Autodesk (OAuth con PKCE, sin secreto): ve solo lo que su cuenta ya puede ver. */
+const API = 'https://developer.api.autodesk.com';
+const $ = id => document.getElementById(id);
+const msg = (t, err) => { $('msg').style.display = 'block'; $('msg').className = err ? 'err' : ''; $('msg').textContent = t; };
+
+const b64u = buf => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+async function pkce() {
+  const v = b64u(crypto.getRandomValues(new Uint8Array(48)));
+  const c = b64u(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(v)));
+  return { v, c };
+}
+
+async function token() {
+  const t = sessionStorage.getItem('aps_token'), exp = +sessionStorage.getItem('aps_exp') || 0;
+  if (t && Date.now() < exp - 60000) return t;
+  const q = new URLSearchParams(location.search);
+  if (q.get('code')) {                                  // vuelta del inicio de sesión
+    const r = await fetch(API + '/authentication/v2/token', {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ grant_type: 'authorization_code', client_id: APS_CLIENT_ID, code: q.get('code'),
+        redirect_uri: APS_REDIRECT, code_verifier: sessionStorage.getItem('aps_verifier') })
+    });
+    const j = await r.json();
+    if (!j.access_token) throw new Error('No se pudo iniciar sesión: ' + JSON.stringify(j));
+    sessionStorage.setItem('aps_token', j.access_token);
+    sessionStorage.setItem('aps_exp', Date.now() + j.expires_in * 1000);
+    history.replaceState(null, '', sessionStorage.getItem('aps_volver') || APS_REDIRECT);
+    return j.access_token;
+  }
+  const { v, c } = await pkce();                         // ir a iniciar sesión
+  sessionStorage.setItem('aps_verifier', v);
+  sessionStorage.setItem('aps_volver', location.pathname + location.search);
+  location.href = API + '/authentication/v2/authorize?' + new URLSearchParams({
+    response_type: 'code', client_id: APS_CLIENT_ID, redirect_uri: APS_REDIRECT, scope: 'data:read viewables:read',
+    code_challenge: c, code_challenge_method: 'S256' });
+  return new Promise(() => {});
+}
+
+async function get(url, tok) {
+  const r = await fetch(API + url, { headers: { Authorization: 'Bearer ' + tok } });
+  if (!r.ok) throw new Error(url + ' → ' + r.status + ' ' + (await r.text()).slice(0, 200));
+  return r.json();
+}
+
+/* item (lineage) → {nombre, versión, urn de versión, bajar()}: bajar() descarga el PDF original (plan B, lento) */
+async function pdf(pid, item, tok) {
+  const tip = await get(`/data/v1/projects/${pid}/items/${encodeURIComponent(item)}/tip`, tok);
+  const d = tip.data, st = d.relationships.storage.data.id;          // urn:adsk.objects:os.object:<bucket>/<objeto>
+  const [bucket, objeto] = st.replace('urn:adsk.objects:os.object:', '').split('/');
+  const bajar = async () => {
+    const s = await get(`/oss/v2/buckets/${bucket}/objects/${encodeURIComponent(objeto)}/signeds3download?minutesExpiration=30`, tok);
+    // El visor añade una cabecera de autorización a sus descargas y S3 rechaza (400) una URL firmada con otra autorización:
+    // el PDF se baja aquí, sin cabeceras, y se le da al visor como blob local.
+    const r = await fetch(s.url);
+    if (!r.ok) throw new Error('Descarga del PDF ' + d.attributes.displayName + ' → ' + r.status);
+    return URL.createObjectURL(await r.blob());
+  };
+  return { nombre: d.attributes.displayName, version: d.attributes.versionNumber, vurn: d.id, bajar };
+}
+
+/* Plan A (rápido): el derivado 2D que Autodesk Docs ya tiene generado de cada plano, el mismo que usa su «Comparar». */
+async function cargarDerivado(viewer, vurn, mantener) {
+  const urn = 'urn:' + btoa(vurn).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const doc = await new Promise((ok, ko) => Autodesk.Viewing.Document.load(urn, ok, (c, m) => ko(new Error('Derivado ' + c + ' ' + m))));
+  const nodo = doc.getRoot().getDefaultGeometry();
+  if (!nodo) throw new Error('El plano no tiene vista 2D generada');
+  return viewer.loadDocumentNode(doc, nodo, { keepCurrentModels: mantener });
+}
+
+(async () => {
+  try {
+    const q = new URLSearchParams(sessionStorage.getItem('aps_volver') && location.search.includes('code=')
+      ? sessionStorage.getItem('aps_volver').split('?')[1] || '' : location.search);
+    const tok = await token();
+    // Los planos de ejemplo (OBR_105 de 0559-101) solo se usan en la prueba local; publicada, hacen falta los parámetros del enlace.
+    const prueba = location.hostname === 'localhost';
+    const p = q.get('p') || (prueba ? 'b.ba950235-5edf-4f8e-a3fd-ad5ad340e793' : ''),
+          a = q.get('a') || (prueba ? 'urn:adsk.wipemea:dm.lineage:Un4qqhFtTZmg3l05YyPaog' : ''),
+          b = q.get('b') || (prueba ? 'urn:adsk.wipemea:dm.lineage:bccln3ZLQ-W1XjAc1BJMTA' : '');
+    if (!p || !a || !b) throw new Error('Faltan parámetros en el enlace (p, a, b).');
+    msg('Obteniendo los dos planos…');
+    const [A, B] = await Promise.all([pdf(p, a, tok), pdf(p, b, tok)]);
+    $('titulo').innerHTML = `<span class="a">${A.nombre} (V${A.version})</span> frente a <span class="b">${B.nombre} (V${B.version})</span>`;
+
+    await new Promise(ok => Autodesk.Viewing.Initializer({ env: 'AutodeskProduction2', api: 'streamingV2',
+      getAccessToken: cb => cb(tok, 3000) }, ok));
+    const viewer = new Autodesk.Viewing.GuiViewer3D($('visor'), { extensions: ['Autodesk.PDF'] });
+    viewer.start();
+    await viewer.loadExtension('Autodesk.PDF');
+    const t0 = performance.now();
+    msg('Cargando en el visor…');
+    let mA, mB, via = 'derivado de Autodesk';
+    try {
+      mA = await cargarDerivado(viewer, A.vurn, false);
+      mB = await cargarDerivado(viewer, B.vurn, true);
+    } catch (e) {
+      console.warn('VISOR plan A falló, se usa el PDF original (lento):', e);
+      via = 'PDF original (lento)';
+      viewer.getAllModels().forEach(m => viewer.unloadModel(m));
+      msg('Sin vista rápida disponible: descargando los PDF originales…');
+      const FLM = Autodesk.Viewing.FileLoaderManager;
+      const cargador = FLM.getFileLoaderForExtension('pdf');
+      const [uA, uB] = await Promise.all([A.bajar(), B.bajar()]);
+      mA = await viewer.loadModel(uA + '#.pdf', { page: 1, fileLoader: cargador });
+      mB = await viewer.loadModel(uB + '#.pdf', { page: 1, keepCurrentModels: true, fileLoader: cargador });
+    }
+    console.log('VISOR carga:', via, Math.round(performance.now() - t0), 'ms');
+    const px = await viewer.loadExtension('Autodesk.Viewing.PixelCompare');
+    // PixelCompare espera a un evento «geometría cargada» que ya puede haber pasado: se espera a que los modelos estén listos
+    const listos = () => viewer.getAllModels().length >= 2 &&
+      viewer.getAllModels().every(m => typeof m.isLoadDone !== 'function' || m.isLoadDone());
+    for (let i = 0; i < 100 && !listos(); i++) await new Promise(r => setTimeout(r, 200));
+    const modelos = viewer.getAllModels();
+    console.log('VISOR modelos:', modelos.length, 'listos:', listos(), 'tipos:', modelos.map(m => m.constructor && m.constructor.name), 'mA/mB:', mA && mA.constructor && mA.constructor.name);
+    px.compareTwoModels(modelos[0], modelos[1], { title: A.nombre, version: A.version }, { title: B.nombre, version: B.version });
+    console.log('VISOR comparación lanzada');
+    $('msg').style.display = 'none';
+  } catch (e) { console.error(e); msg(String(e.message || e), true); }
+})();
+</script>
+</body>
+</html>
