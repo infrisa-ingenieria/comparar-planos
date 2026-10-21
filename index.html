@@ -152,15 +152,57 @@ async function abrir(p, a, directo, tok) {
   }
 }
 
+/* Modo «abrir» por CARPETA Y NOMBRE (f, n): no depende del identificador del archivo, que cambia si alguien lo borra y lo vuelve a
+   subir o lo saca de la carpeta y lo mete de nuevo. Busca en la carpeta vigente la revisión más alta de ese plano y la compara con la
+   que enlazaba la lista:  igual → se abre;  más nueva → aviso + se abre la nueva;  no hay ninguna → aviso («no la uses sin confirmarlo»). */
+async function abrirPorNombre(p, f, n, directo, tok) {
+  const guid = p.split('.').slice(1).join('.');
+  const enc = encodeURIComponent;
+  const url = (carpeta, item) => `https://acc.autodesk.eu/docs/files/projects/${guid}?folderUrn=${enc(carpeta)}&entityId=${enc(item)}&viewModel=detail&moduleId=folders`;
+  const rev = +((n.match(/_(\d{1,2})\.pdf$/i) || [])[1]);
+  const base = n.replace(/_\d{1,2}\.pdf$/i, '');
+  msg('Comprobando que es la revisión vigente…');
+  const lista = (await get(`/data/v1/projects/${p}/folders/${enc(f)}/contents?filter[attributes.displayName]-contains=${enc(base + '_')}`, tok)).data || [];
+  const re = new RegExp('^' + base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '_(\\d{1,2})\\.pdf$', 'i');
+  const cand = lista.filter(x => x.type === 'items' && re.test(x.attributes.displayName || ''))
+                    .map(x => ({ id: x.id, nombre: x.attributes.displayName, rev: +re.exec(x.attributes.displayName)[1] }))
+                    .sort((x, y) => y.rev - x.rev);
+  $('titulo').textContent = n;
+  const de = directo ? `<a class="sec" href="${esc(directo)}">Abrir el archivo del enlace de todos modos (puede estar anulado)</a>` : '';
+  if (cand.length && cand[0].rev === rev) {                         // sigue siendo la vigente
+    msg('Revisión vigente. Abriendo ' + cand[0].nombre + '…');
+    location.replace(url(f, cand[0].id));
+    return;
+  }
+  $('msg').style.display = 'none';
+  const av = $('aviso');
+  av.style.display = 'block';
+  if (cand.length) {
+    const nueva = cand[0], dest = url(f, nueva.id), mayor = nueva.rev > rev;
+    $('titulo').innerHTML = `<span class="a">${esc(n)}</span> → <span class="b">${esc(nueva.nombre)}</span>`;
+    av.innerHTML = `<div class="caja"><h1>⚠ Esa revisión ya no es la vigente</h1>
+      <p>La revisión <b>${rev}</b> de este plano ${mayor ? 'ha sido <b>sustituida</b>' : '<b>ya no está en su carpeta</b>'}: la revisión vigente es la <b>${nueva.rev}</b>.</p>
+      <p>Te abro la vigente en <span id="cuenta">6</span> segundos.</p>
+      <a class="btn" href="${esc(dest)}">Abrir ahora la revisión ${nueva.rev}</a>${de}</div>`;
+    let t = 6;
+    const iv = setInterval(() => { t--; if ($('cuenta')) $('cuenta').textContent = t; if (t <= 0) { clearInterval(iv); location.replace(dest); } }, 1000);
+  } else {
+    av.innerHTML = `<div class="caja"><h1>⚠ Este plano ya no tiene revisión vigente en su carpeta</h1>
+      <p>La revisión <b>${rev}</b> ya no está en la carpeta de planos vigentes y <b>no hay otra revisión</b> en su lugar. Puede haberse anulado o movido a otra carpeta.</p>
+      <p><b>No la uses sin confirmarlo.</b></p>${de}</div>`;
+  }
+}
+
 (async () => {
   try {
     const q = new URLSearchParams(sessionStorage.getItem('aps_volver') && location.search.includes('code=')
       ? sessionStorage.getItem('aps_volver').split('?')[1] || '' : location.search);
     // Los planos de ejemplo (OBR_105 de 0559-101) solo se usan en la prueba local; publicada, hacen falta los parámetros del enlace.
     if (q.get('modo') === 'abrir') {
-      if (!q.get('p') || !q.get('a')) throw new Error('Falta el plano en el enlace (p, a).');
+      if (!q.get('p') || !(q.get('a') || (q.get('f') && q.get('n')))) throw new Error('Falta el plano en el enlace.');
       const tokA = await token();
-      await abrir(q.get('p'), q.get('a'), q.get('d'), tokA);
+      if (q.get('f') && q.get('n')) await abrirPorNombre(q.get('p'), q.get('f'), q.get('n'), q.get('d'), tokA);
+      else await abrir(q.get('p'), q.get('a'), q.get('d'), tokA);
       return;
     }
     const prueba = location.hostname === 'localhost';
